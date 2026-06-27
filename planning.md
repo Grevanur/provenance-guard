@@ -1,0 +1,253 @@
+# Provenance Guard — Planning Document
+
+## Detection Signals
+
+### Signal 1: LLM-Based Classification (Groq / llama-3.3-70b-versatile)
+
+**What it measures:** The holistic semantic and stylistic coherence of the text — whether the writing "feels" like it came from a language model. The model assesses patterns including hedging language, uniform sentence rhythm, generic framing, and the absence of genuine personal voice or unexpected word choices.
+
+**Output:** A float `ai_probability` in [0.0, 1.0] parsed from a structured JSON response.
+
+**Why it differs between human and AI writing:** LLMs trained on vast text corpora produce writing that is statistically "average" — coherent and grammatically correct but lacking the idiosyncrasy of a real person. A skilled LLM can spot the very patterns it generates.
+
+**Blind spots:** Short texts (< 50 words) give the LLM too little signal. Highly polished human prose — academic writing, formal journalism — can trigger false positives because it shares surface features with LLM output. Conversely, an LLM prompted to "write informally" can fool this signal.
+
+---
+
+### Signal 2: Stylometric Heuristics (pure Python)
+
+**What it measures:** Three measurable structural properties of the text:
+
+1. **Sentence-length variance** — AI text tends to use more uniform sentence lengths; human text varies more.
+2. **Type-token ratio (TTR)** — the proportion of unique words to total words. AI text reuses vocabulary at a slightly higher rate at scale.
+3. **Period-ending ratio** — the fraction of sentences ending with a period. AI writing is grammatically "complete" at a more consistent rate; human writing includes more fragments, exclamations, and mid-sentence pivots.
+
+**Output:** A weighted combination of the three metrics, normalized to [0.0, 1.0].
+
+**Why it differs:** AI models are trained to produce clean, readable prose. That cleanliness shows up as measurable uniformity across these structural features.
+
+**Blind spots:** Very short texts produce unreliable variance estimates. Formal human genres (academic papers, legal writing) have naturally low TTR and high period rates, which can inflate the stylo score. Creative writing that intentionally uses repetition (anaphora, litany) may also score higher than expected.
+
+---
+
+### Combining Signals into a Confidence Score
+
+```
+confidence = 0.65 × llm_score + 0.35 × stylo_score
+```
+
+The LLM signal receives higher weight because it captures semantic coherence — a property that purely structural metrics miss. The stylometric signal acts as a corroborating layer; if both signals agree, the combined score is more reliable.
+
+---
+
+## Uncertainty Representation
+
+### What confidence scores mean
+
+| Score range | Meaning |
+|---|---|
+| 0.00 – 0.35 | Likely human-written — strong human signal from both detectors |
+| 0.36 – 0.74 | Uncertain — signals disagree or are ambiguous; insufficient evidence to label |
+| 0.75 – 1.00 | Likely AI-generated — strong AI signal from both detectors |
+
+**Asymmetric thresholds (intentional design decision):** The threshold for calling content "AI-generated" (0.75) is higher than the threshold for calling it "human-written" (0.35). This reflects the real-world cost asymmetry: falsely flagging a human creator's work as AI-generated is a more harmful error than failing to catch an AI-generated submission. The system is biased toward being cautious — it must be more confident before applying the AI label.
+
+**What 0.6 means:** "The system saw enough AI-like patterns to pay attention, but not enough to make a confident attribution. The content will not be labeled as AI-generated; uncertainty is surfaced to the reader instead."
+
+---
+
+## Transparency Label Design
+
+Three variants (written as they appear in the API response and README):
+
+### High-confidence AI (`attribution: "likely_ai"`, confidence ≥ 0.75)
+
+> "AI-Assisted Content Detected — High Confidence ({pct}%)
+> Our system found strong signals of AI-generated writing in this submission, including uniform sentence structure and phrasing patterns typical of language models. This label does not prevent the content from being shared, but is shown to readers for context. If you are the human author of this work and believe this is incorrect, you may submit an appeal and a human reviewer will examine your case."
+
+### High-confidence Human (`attribution: "likely_human"`, confidence ≤ 0.35)
+
+> "Original Human Authorship — High Confidence ({pct}%)
+> Our system found strong signals of human authorship in this submission: natural variation in sentence rhythm, vocabulary diversity, and stylistic irregularities consistent with original human writing. No AI-generation label is shown to readers."
+
+### Uncertain (`attribution: "uncertain"`, 0.35 < confidence < 0.75)
+
+> "Origin Unclear — Further Review May Be Needed ({pct}% confidence)
+> Our system detected a mixed signal and could not confidently determine whether this content was written by a human or generated by AI. It may be human-written, AI-assisted, or AI-generated with heavy human editing. Out of caution, this content is not labeled as AI-generated. If you feel the ambiguity reflects poorly on your work, you may submit an appeal to request human review."
+
+---
+
+## Appeals Workflow
+
+**Who can appeal:** Any creator, by providing the `content_id` returned at submission time.
+
+**What they provide:** `content_id` (required) + `creator_reasoning` (required) — a free-text explanation of why they believe the classification is wrong.
+
+**What the system does when an appeal is received:**
+1. Looks up the original entry in the audit log.
+2. Updates `status` from `"classified"` to `"under_review"`.
+3. Records `appeal_reasoning` and `appeal_timestamp` in the same audit log row.
+4. Returns a confirmation JSON with the updated status.
+
+**What a human reviewer sees when they open the appeal queue (`GET /log`):**
+- The original attribution, confidence score, both signal scores, and the text snippet.
+- The creator's stated reasoning and the timestamp of the appeal.
+- Current status: `"under_review"`.
+
+Automated re-classification is not implemented — all resolution is manual.
+
+---
+
+## Anticipated Edge Cases
+
+1. **Minimalist poetry with simple, uniform vocabulary** (e.g., haiku, imagist poems): Low TTR and short, uniform sentence fragments will push the stylo signal toward AI-like, even though the brevity is a deliberate human artistic choice. The LLM signal often correctly identifies poetic intent, but if both signals converge, such poems may land in the uncertain zone or trigger a false positive.
+
+2. **Lightly edited AI output** (a user takes ChatGPT output and makes minor edits): The LLM signal may score this mid-range because the holistic feel is still LLM-like, but small human edits introduce variance that drags the stylo score down. The result is a mid-range confidence score (0.55–0.70) that lands in the uncertain zone — correct behavior (the content is genuinely mixed), but potentially frustrating for a reviewer expecting a clean classification.
+
+3. **Very short texts (< 80 words)**: Both signals degrade — the LLM has little to analyze, and variance estimates over 2–3 sentences are statistically meaningless. The system defaults toward uncertain for very short inputs.
+
+4. **Formal academic or legal writing by humans**: High period-ending ratio, moderate TTR, and uniform sentence structure make such texts resemble AI output on the stylometric signal. The LLM signal usually compensates because academic prose has distinctive citation patterns and domain jargon, but borderline cases will appear in the uncertain zone.
+
+---
+
+## Architecture
+
+```
+POST /submit
+    │
+    ├─── [text, creator_id] ──► Flask route (/submit)
+    │                                │
+    │                         rate limiter check
+    │                                │
+    │                    ┌──────────┴──────────┐
+    │                    │                     │
+    │              llm_signal()          stylo_signal()
+    │          (Groq API call)        (pure Python math)
+    │              llm_score              stylo_score
+    │                    │                     │
+    │                    └──────────┬──────────┘
+    │                               │
+    │                      combine_signals()
+    │                          confidence
+    │                               │
+    │                       get_attribution()
+    │                          attribution
+    │                               │
+    │                       generate_label()
+    │                     transparency_label
+    │                               │
+    │                       log_submission()
+    │                        (SQLite write)
+    │                               │
+    └─────────────────────── JSON response ◄────────────────────
+                    {content_id, attribution, confidence,
+                     signals, transparency_label, status}
+
+
+POST /appeal
+    │
+    ├─── [content_id, creator_reasoning] ──► Flask route (/appeal)
+    │                                               │
+    │                                        fetch_entry()
+    │                                     (lookup in SQLite)
+    │                                               │
+    │                                       update_appeal()
+    │                              (status → "under_review",
+    │                               log appeal_reasoning + timestamp)
+    │                                               │
+    └───────────────────────────── JSON response ◄──┘
+                    {message, content_id, status}
+
+
+GET /log
+    └─── fetch_log() ──► [{audit entries...}]
+```
+
+**Submission flow:** Text arrives at `POST /submit`, is rate-checked, then fed in parallel to the LLM signal (semantic) and stylometric signal (structural). The two scores are combined into a confidence value, mapped to an attribution category, and used to select a transparency label. The complete decision is written to SQLite before the response is returned.
+
+**Appeal flow:** A creator submits `content_id` + reasoning to `POST /appeal`. The system looks up the original decision, updates its status to `"under_review"`, and appends the appeal to the same audit log row. No automated re-classification occurs — a human reviewer reads the log via `GET /log`.
+
+---
+
+## AI Tool Plan
+
+### M3 — Submission endpoint + first signal (Groq LLM)
+- **Spec sections provided:** Detection signals section + Architecture diagram
+- **Ask:** Generate Flask app skeleton with `POST /submit` route stub + `llm_signal()` function that calls Groq and parses a JSON response
+- **Verification:** Call `llm_signal()` directly with 3 test strings (clear AI, clear human, ambiguous) and inspect the returned float before wiring into the endpoint
+
+### M4 — Second signal + confidence scoring
+- **Spec sections provided:** Detection signals section + Uncertainty representation section + Architecture diagram
+- **Ask:** Generate `stylo_signal()` computing sentence-length variance, TTR, and period ratio + `combine_signals()` using the 0.65/0.35 weighted average
+- **Verification:** Run both signals on the same 4 test inputs; confirm clearly-AI text scores ≥ 0.75 and clearly-human text scores ≤ 0.35; check that borderline inputs land in the 0.40–0.70 range
+
+### M5 — Production layer (labels, appeals, rate limiting, audit log)
+- **Spec sections provided:** Transparency label design + Appeals workflow + Architecture diagram
+- **Ask:** Generate `generate_label()` mapping confidence → label text + `POST /appeal` endpoint with SQLite update + Flask-Limiter decorator on `/submit`
+- **Verification:** Submit inputs that trigger all three label variants; POST an appeal and confirm `GET /log` shows `"status": "under_review"` and `appeal_reasoning` populated; run the 12-request rate-limit test
+
+---
+
+## Stretch Features
+
+### Stretch 1: Ensemble Detection (3rd signal)
+
+**Signal 3 — Linguistic Pattern Density:**
+
+**What it measures:** Two linguistic fingerprinting properties independent of both sentence structure (Signal 2) and semantic coherence (Signal 1):
+1. **Sentence-starter repetition:** AI text frequently reuses a small set of sentence-opening words ("It", "The", "This", "Furthermore", "Moreover"). Low variety of first-words → more AI-like.
+2. **Boilerplate phrase density:** AI formal prose uses hedging/transitional phrases ("it is important to", "furthermore", "it is essential", "in conclusion") at a measurably higher rate than human writing. Measured as occurrences per 100 words.
+
+**Output:** Float in [0.0, 1.0] (`burstiness_score`). Returns 0.5 (neutral) for texts with fewer than 3 sentences.
+
+**Combining three signals:**
+
+```
+confidence = 0.70 × llm_score + 0.20 × stylo_score + 0.10 × burstiness_score
+```
+
+**Conflict resolution:** When signals disagree, the LLM's holistic judgment dominates due to its highest weight. A split scenario (LLM=0.8, stylo=0.3, burstiness=0.4) produces a confidence of 0.660 — landing in the uncertain zone rather than forcing a binary verdict. This is intentional: signal disagreement itself is evidence of uncertainty.
+
+**Blind spots:** Academic human writing may contain some transitional phrases. Texts with fewer than 3 sentences return neutral (0.5).
+
+---
+
+### Stretch 2: Provenance Certificate
+
+**Design:** A creator earns a "Verified Human Author" certificate by completing a human-attestation step: providing a signed statement (`human_statement`, minimum 20 characters) to `POST /certify` along with their `content_id`.
+
+**Verification step:** The creator must provide a substantive first-person statement explaining their authorship of the specific work. The system stores this statement and issues a certificate with a distinct `verified_label`.
+
+**What the verified label shows:** The verified label is visually and textually distinct from the standard `transparency_label`:
+- Standard label: describes the automated classification result only.
+- Verified label: begins with `[VERIFIED HUMAN AUTHOR — Certificate <short-id>]`, includes the creator's signed statement verbatim, the issuance date, and notes the automated classification on file alongside it.
+
+The certificate does not override the automated classification — both are shown to readers, letting them see both the system's verdict and the creator's attestation.
+
+**Storage:** `certificates` table in SQLite. `GET /content/<content_id>` returns both the audit log entry and the certificate (if any).
+
+---
+
+### Stretch 3: Analytics Dashboard
+
+`GET /analytics` returns three metrics:
+
+1. **Detection pattern:** Attribution breakdown (count + % for `likely_ai`, `likely_human`, `uncertain`).
+2. **Appeal rate:** Number of appealed submissions / total submissions, as a percentage.
+3. **Average confidence by attribution:** Mean confidence score within each attribution category — reveals how certain the system is when it assigns each verdict (useful for calibration monitoring).
+
+---
+
+### Stretch 4: Multi-Modal Support
+
+**Second content type: structured metadata**
+
+`POST /submit` with `content_type: "metadata"` accepts a `metadata` object with fields: `title`, `description`, `tags` (array), `word_count` (optional).
+
+**Signals for metadata:**
+- **LLM signal (`metadata_llm_signal`):** Groq is asked whether the metadata reads as AI-generated, focusing on generic phrases in descriptions and formulaic titles.
+- **Structural signal (`metadata_structural_signal`):** Three heuristics — personal pronoun presence in description (human creators refer to themselves; AI descriptions are impersonal), generic AI phrase detection, and tag count (AI produces exhaustive systematic tags; humans pick a small specific set).
+
+**Combining:** `confidence = 0.60 × llm_score + 0.40 × structural_score` (burstiness is not applicable to metadata).
+
+The response structure is identical to text submissions — same `content_id`, `attribution`, `confidence`, `transparency_label`, `status` fields — so the pipeline handles both types uniformly.
